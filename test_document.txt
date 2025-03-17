@@ -1,1 +1,1 @@
-Ceci est un document de test pour vérifier que Milvus fonctionne correctement.
+Ceci est un document test pour tester la fonctionnalité RAG. Il contient des informations sur l'intelligence artificielle et le traitement du langage naturel.

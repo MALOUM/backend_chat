@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional, Union, AsyncGenerator, Callable
 from app import config
 from app.db.mongodb import get_chat_session_collection, get_message_collection
 from app.models.chat import MessageRole
-
+from app.core.rag_pipeline import RAGPipelineFactory
 from app.core.chat_memory import ChatMemoryManager
 from app.core.llm_streaming import StreamingManager, ModelProvider
 from app.core.hf_llm import HuggingFaceLLM
@@ -98,97 +98,7 @@ class ChatProcessor:
         else:
             raise ValueError(f"Fournisseur LLM non supporté: {provider}")
     
-    async def generate_response(
-        self,
-        query: str,
-        session_id: str,
-        user_id: str,
-        context: Optional[str] = None,
-        rag_enabled: bool = True,
-        rag_strategy: Optional[str] = None,
-        provider: Optional[str] = None,
-        max_tokens: int = 1024,
-        temperature: float = 0.7
-    ) -> str:
-        """
-        Génère une réponse à une requête utilisateur.
-        
-        Args:
-            query: Question ou requête de l'utilisateur
-            session_id: ID de la session de chat
-            user_id: ID de l'utilisateur
-            context: Contexte supplémentaire (ex: résultats RAG)
-            rag_enabled: Si True, RAG est activé pour cette requête
-            rag_strategy: Stratégie RAG à utiliser
-            provider: Fournisseur LLM à utiliser
-            max_tokens: Nombre maximum de tokens dans la réponse
-            temperature: Température de génération (créativité)
-            
-        Returns:
-            Texte de la réponse générée
-        """
-        # Initialiser le gestionnaire de mémoire de conversation
-        memory_manager = ChatMemoryManager(session_id, user_id)
-        
-        # Ajouter le message utilisateur à l'historique
-        metadata = {
-            "rag_enabled": rag_enabled,
-            "rag_strategy": rag_strategy
-        }
-        await memory_manager.add_user_message(query, metadata)
-        
-        # Préparer les messages pour le LLM
-        messages = await memory_manager.get_messages_for_llm()
-        
-        # Ajouter le contexte RAG si disponible
-        if context and rag_enabled:
-            system_msg = {
-                "role": "system",
-                "content": f"Utilise les informations suivantes pour répondre à la question de l'utilisateur:\n\n{context}"
-            }
-            messages.insert(0, system_msg)
-        
-        try:
-            # Obtenir le client LLM approprié
-            llm_client = self.get_llm_client(provider)
-            
-            # Choisir la méthode de génération en fonction du fournisseur
-            provider_type = self.get_model_provider(provider)
-            
-            if provider_type == ModelProvider.OPENAI:
-                # Utiliser l'API OpenAI
-                response = await llm_client.chat.completions.create(
-                    model=config.LLM_MODEL,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature
-                )
-                response_text = response.choices[0].message.content
-                
-            elif provider_type in [ModelProvider.HUGGINGFACE, ModelProvider.LMSTUDIO]:
-                # Utiliser l'implémentation spécifique
-                response_text = await llm_client.generate_from_messages(
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature
-                )
-                
-            else:
-                raise ValueError(f"Fournisseur non supporté: {provider}")
-            
-            # Enregistrer la réponse dans l'historique
-            await memory_manager.add_assistant_message(response_text)
-            
-            return response_text
-            
-        except Exception as e:
-            error_msg = f"Erreur lors de la génération de la réponse: {str(e)}"
-            logger.error(error_msg)
-            
-            # Enregistrer l'erreur dans l'historique
-            await memory_manager.add_assistant_message(f"[ERROR]: {error_msg}")
-            
-            raise
+    
     
     async def generate_response_stream(
         self,
@@ -205,7 +115,7 @@ class ChatProcessor:
         temperature: float = 0.7
     ) -> AsyncGenerator[str, None]:
         """
-        Génère une réponse en streaming à une requête utilisateur.
+        Génère une réponse en streaming à une requête utilisateur avec support RAG optimisé.
         
         Args:
             query: Question ou requête de l'utilisateur
@@ -215,16 +125,13 @@ class ChatProcessor:
             abort_signal: Signal d'annulation pour interrompre la génération
             message_id: ID du message assistant (si déjà créé)
             rag_enabled: Si True, RAG est activé pour cette requête
-            rag_strategy: Stratégie RAG à utiliser
+            rag_strategy: Stratégie RAG à utiliser (basic, hybrid_search, reranking)
             provider: Fournisseur LLM à utiliser
             max_tokens: Nombre maximum de tokens dans la réponse
             temperature: Température de génération (créativité)
             
         Yields:
             Morceaux de texte générés
-            
-        Raises:
-            Exception: Si une erreur se produit pendant la génération
         """
         # Récupérer la collection de messages
         message_collection = await get_message_collection()
@@ -258,6 +165,32 @@ class ChatProcessor:
         }
         await message_collection.insert_one(assistant_message)
         
+        # Récupérer des documents pertinents si RAG est activé
+        if rag_enabled and not context:
+            try:
+                # Informer l'utilisateur que la recherche est en cours
+                yield "[Recherche d'informations pertinentes...]\n\n"
+                
+                # Créer la stratégie RAG appropriée
+                
+                rag_strategy_instance = RAGPipelineFactory.create_strategy(rag_strategy, user_id)
+                
+                # Récupérer le contexte avec la stratégie sélectionnée
+                context = await rag_strategy_instance.get_relevant_context(query, session_id)
+                
+                logger.info(f"Contexte RAG récupéré: {len(context) if context else 0} caractères")
+                
+                if context:
+                    # Petite pause pour montrer que la recherche est terminée
+                    await asyncio.sleep(0.5)
+                    yield "[Informations trouvées]\n\n"
+                    
+            except Exception as e:
+                logger.error(f"Erreur lors de la récupération du contexte RAG: {str(e)}")
+                yield f"[Erreur lors de la recherche d'informations: utilisation des connaissances générales]\n\n"
+                # En cas d'erreur, continuer sans contexte
+                context = None
+        
         # Préparer les messages pour le LLM
         messages = await memory_manager.get_messages_for_llm()
         
@@ -265,7 +198,15 @@ class ChatProcessor:
         if context and rag_enabled:
             system_msg = {
                 "role": "system",
-                "content": f"Utilise les informations suivantes pour répondre à la question de l'utilisateur:\n\n{context}"
+                "content": (
+                    "Utilise les informations suivantes pour répondre à la question de l'utilisateur.\n\n"
+                    f"{context}\n\n"
+                    "Respecte ces consignes:\n"
+                    "1. Cite clairement les sources quand tu utilises les informations fournies\n"
+                    "2. Si les informations ne sont pas suffisantes, complète avec tes connaissances\n"
+                    "3. Indique quand tu utilises tes connaissances vs les informations fournies\n"
+                    "4. Ne fabrique jamais de fausses informations ou citations"
+                )
             }
             messages.insert(0, system_msg)
         
