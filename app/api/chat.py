@@ -422,8 +422,7 @@ async def stream_chat(
             except Exception as e:
                 logger.error(f"Erreur lors de la recherche avec ObjectId: {e}")
         
-        # Si la session n'est toujours pas trouvée, essayer d'autres méthodes (bien que l'inspection
-        # indique qu'elles ne fonctionneront probablement pas)
+        # Si la session n'est toujours pas trouvée, essayer d'autres méthodes
         if not session:
             logger.warning(f"Session non trouvée avec ObjectId, essai avec chaîne...")
             session = await session_collection.find_one({
@@ -454,35 +453,17 @@ async def stream_chat(
                 detail=f"Session {session_id} non trouvée"
             )
         
-        # Créer un ID pour le message utilisateur
-        message_id = str(ObjectId())
-        now = datetime.utcnow()
-        
         # Récupérer le bon ID de session pour le stockage
         session_id_for_storage = str(session["_id"]) if "_id" in session else session_id
         
-        # Enregistrer le message utilisateur
-        user_message = ChatMessage(
-            _id=message_id,
-            session_id=session_id_for_storage,
-            role=MessageRole.USER,
-            content=message,
-            timestamp=now
-        )
-        
-        await message_collection.insert_one(user_message.dict(by_alias=True))
-        
-        # Mettre à jour la date de dernière modification de la session
-        await session_collection.update_one(
-            {"_id": session["_id"] if "_id" in session else session_id},
-            {"$set": {"updated_at": now}}
-        )
-        
         # ID pour la réponse assistant (sera utilisé pour l'annulation)
-        response_id = str(ObjectId())
+        response_id = str(uuid.uuid4()).replace("-", "")
         
         # Signal d'annulation pour arrêter la génération
         abort_signal = asyncio.Event()
+        
+        # Initialiser le processeur de chat
+        chat_processor = ChatProcessor()
         
         # Fonction pour générer les événements SSE
         async def event_generator():
@@ -493,53 +474,36 @@ async def stream_chat(
                     "data": json.dumps({"message_id": response_id})
                 }
                 
-                # Indiquer que le message est en cours de génération
-                assistant_message = ChatMessage(
-                    _id=response_id,
-                    session_id=session_id_for_storage,
-                    role=MessageRole.ASSISTANT,
-                    content="",
-                    metadata={"status": "generating"},
-                    timestamp=datetime.utcnow()
-                )
-                
-                await message_collection.insert_one(assistant_message.dict(by_alias=True))
-                
                 # Démarrer la génération en streaming
                 full_response = ""
                 
-                async for token in ChatProcessor.generate_streaming_response(
+                async for token in chat_processor.generate_response_stream(
                     query=message,
                     session_id=session_id_for_storage,
-                    user_id=current_user.id,
+                    user_id=str(current_user.id),
                     abort_signal=abort_signal,
                     message_id=response_id,
                     rag_enabled=rag_enabled,
                     rag_strategy=rag_strategy
                 ):
-                    full_response += token
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({"token": token, "message_id": response_id})
-                    }
-                    
-                    # Vérifier si la génération a été annulée
-                    if abort_signal.is_set():
-                        full_response += " [GÉNÉRATION ANNULÉE]"
+                    if token.startswith("[ERROR]"):
+                        yield {
+                            "event": "error",
+                            "data": json.dumps({"error": token, "message_id": response_id})
+                        }
+                        break
+                    elif token == "[CANCELLED]":
                         yield {
                             "event": "cancelled",
                             "data": json.dumps({"message_id": response_id})
                         }
                         break
-                
-                # Mettre à jour le message avec la réponse complète
-                await message_collection.update_one(
-                    {"_id": response_id},
-                    {"$set": {
-                        "content": full_response,
-                        "metadata.status": "completed"
-                    }}
-                )
+                    else:
+                        full_response += token
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({"token": token, "message_id": response_id})
+                        }
                 
                 # Événement de fin
                 yield {
@@ -551,18 +515,8 @@ async def stream_chat(
                 logger.error(f"Erreur lors du streaming: {str(e)}")
                 yield {
                     "event": "error",
-                    "data": json.dumps({"error": str(e), "message_id": response_id})
+                    "data": json.dumps({"error": f"Erreur lors de la génération: {str(e)}", "message_id": response_id})
                 }
-                
-                # Mettre à jour le message avec l'erreur
-                await message_collection.update_one(
-                    {"_id": response_id},
-                    {"$set": {
-                        "content": f"Erreur: {str(e)}",
-                        "metadata.status": "error",
-                        "metadata.error": str(e)
-                    }}
-                )
         
         return EventSourceResponse(event_generator())
         
@@ -596,10 +550,19 @@ async def cancel_streaming(
         if not session or session["user_id"] != current_user.id:
             return CancelResponse(status="not_found", message="Session non trouvée ou non autorisée")
         
-        # Annuler la génération
-        cancelled = await ChatProcessor.abort_generation(message_id)
+        # Initialiser le processeur de chat et annuler la génération
+        chat_processor = ChatProcessor()
+        cancelled = chat_processor.cancel_generation(message_id)
         
         if cancelled:
+            # Mettre à jour le message avec l'indication d'annulation
+            await message_collection.update_one(
+                {"_id": message_id},
+                {"$set": {
+                    "content": message["content"] + " [GÉNÉRATION ANNULÉE]",
+                    "metadata.status": "cancelled"
+                }}
+            )
             return CancelResponse(status="success", message="Génération annulée avec succès")
         else:
             return CancelResponse(status="not_found", message="Aucune génération active trouvée pour ce message")

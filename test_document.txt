@@ -1,0 +1,1 @@
+Ceci est un document de test pour vérifier que Milvus fonctionne correctement.

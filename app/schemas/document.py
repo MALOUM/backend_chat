@@ -45,3 +45,30 @@ class ChunkingStrategy(str, Enum):
     SEMANTIC = "semantic"
     SENTENCE = "sentence"
     PARAGRAPH = "paragraph"
+
+# Nouveaux schémas pour le traitement avancé
+class ChunkingConfig(BaseModel):
+    """Configuration pour le chunking de documents"""
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    chunking_method: ChunkingStrategy = ChunkingStrategy.RECURSIVE
+
+class EmbeddingConfig(BaseModel):
+    """Configuration pour l'embedding de documents"""
+    model_name: str = "all-MiniLM-L6-v2"
+    dimension: int = 384
+    batch_size: int = 32
+
+class ProcessingRequest(BaseModel):
+    """Requête de traitement d'un document avec configuration personnalisée"""
+    document_id: Optional[str] = None
+    chunking_config: Optional[ChunkingConfig] = None
+    embedding_config: Optional[EmbeddingConfig] = None
+
+class ProcessingResponse(BaseModel):
+    """Réponse du traitement d'un document"""
+    document_id: str
+    status: ProcessingStatus
+    message: str
+    chunks_count: Optional[int] = None
+    error: Optional[str] = None
